@@ -18,8 +18,7 @@ export const DENO_PATH = join(TUBERUN_DIR, 'deno')
 
 // Download URLs (macOS)
 const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos'
-const FFMPEG_URL_ARM64 = 'https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-macosarm64-gpl.tar.xz'
-const FFMPEG_URL_X64 = 'https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-macos64-gpl.tar.xz'
+const FFMPEG_URL = 'https://evermeet.cx/ffmpeg/getrelease/zip'
 const DENO_URL_ARM64 = 'https://github.com/denoland/deno/releases/latest/download/deno-aarch64-apple-darwin.zip'
 const DENO_URL_X64 = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-apple-darwin.zip'
 
@@ -76,10 +75,9 @@ export async function downloadDependencies(
   // Download FFmpeg
   onProgress('ffmpeg', 0, 'downloading')
   try {
-    const ffmpegUrl = isArm64 ? FFMPEG_URL_ARM64 : FFMPEG_URL_X64
-    const ffmpegArchive = join(TUBERUN_DIR, 'ffmpeg.tar.xz')
+    const ffmpegArchive = join(TUBERUN_DIR, 'ffmpeg.zip')
 
-    await downloadFile(ffmpegUrl, ffmpegArchive, (percent) => {
+    await downloadFile(FFMPEG_URL, ffmpegArchive, (percent) => {
       onProgress('ffmpeg', percent * 0.8, 'downloading') // 80% for download
     })
 
@@ -118,10 +116,16 @@ async function downloadFile(
   onProgress: (percent: number) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
+    let currentUrl = url
+
     const handleResponse = (response: any) => {
       // Handle redirects
       if (response.statusCode === 301 || response.statusCode === 302) {
-        https.get(response.headers.location, handleResponse).on('error', reject)
+        const redirectUrl = response.headers.location
+        // Resolve relative URLs against the current URL
+        const resolvedUrl = new URL(redirectUrl, currentUrl).href
+        currentUrl = resolvedUrl
+        https.get(resolvedUrl, handleResponse).on('error', reject)
         return
       }
 
@@ -153,7 +157,7 @@ async function downloadFile(
 }
 
 async function extractFFmpeg(archivePath: string): Promise<void> {
-  // Extract tar.xz and find ffmpeg binary
+  // Extract zip and find ffmpeg binary
   const extractDir = join(TUBERUN_DIR, 'ffmpeg-extract')
 
   // Create extract dir
@@ -161,8 +165,8 @@ async function extractFFmpeg(archivePath: string): Promise<void> {
     mkdirSync(extractDir, { recursive: true })
   }
 
-  // Extract using tar
-  await execAsync(`tar -xf "${archivePath}" -C "${extractDir}"`)
+  // Extract using unzip
+  await execAsync(`unzip -o "${archivePath}" -d "${extractDir}"`)
 
   // Find and copy ffmpeg binary
   const { stdout } = await execAsync(`find "${extractDir}" -name "ffmpeg" -type f`)
