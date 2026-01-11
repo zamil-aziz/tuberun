@@ -1,7 +1,7 @@
 {
   "name": "tuberun",
   "version": "1.0.0",
-  "description": "YouTube to MP3 converter for macOS",
+  "description": "YouTube to MP3 converter",
   "main": "out/main/index.js",
   "author": "TubeRun",
   "license": "MIT",
@@ -10,10 +10,14 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "package": "electron-builder --mac",
+    "package:win": "electron-builder --win",
+    "package:all": "electron-builder -mw",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
     "electron-store": "^8.1.0",
+    "electron-updater": "^6.7.3",
+    "extract-zip": "^2.0.1",
     "fluent-ffmpeg": "^2.1.3",
     "howler": "^2.2.4",
     "zustand": "^4.5.0"
@@ -41,8 +45,31 @@
     "productName": "TubeRun",
     "mac": {
       "category": "public.app-category.music",
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "icon": "resources/icon.icns"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "resources/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "zamil",
+      "repo": "tuberun",
+      "releaseType": "release"
     },
     "directories": {
       "output": "release"

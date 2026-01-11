@@ -1,9 +1,14 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import { autoUpdater } from 'electron-updater'
 import { checkDependencies, downloadDependencies } from './services/setup'
 import { startDownload, cancelDownload } from './services/downloader'
 import { getHistory, addToHistory, clearHistory } from './services/history'
+
+// Platform detection
+const isMac = process.platform === 'darwin'
+const isWindows = process.platform === 'win32'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -14,8 +19,11 @@ function createWindow(): void {
     minWidth: 600,
     minHeight: 500,
     show: false,
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 15, y: 10 },
+    // Platform-specific title bar styling
+    ...(isMac ? {
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: { x: 15, y: 10 },
+    } : {}),
     backgroundColor: '#1a1a1a',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -66,6 +74,11 @@ app.whenReady().then(() => {
   })
 
   createWindow()
+
+  // Check for updates (not in dev mode)
+  if (!is.dev) {
+    autoUpdater.checkForUpdatesAndNotify()
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

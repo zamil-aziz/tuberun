@@ -6,6 +6,10 @@ import ffmpeg from 'fluent-ffmpeg'
 import { YTDLP_PATH, FFMPEG_PATH, TUBERUN_DIR } from './setup'
 import { addToHistory } from './history'
 
+// Platform detection
+const isWindows = process.platform === 'win32'
+const PATH_SEPARATOR = isWindows ? ';' : ':'
+
 // Output directory
 const OUTPUT_DIR = join(app.getPath('downloads'), 'TubeRun')
 
@@ -93,7 +97,7 @@ async function downloadWithYtDlp(
     const infoProcess = spawn(YTDLP_PATH, infoArgs, {
       env: {
         ...process.env,
-        PATH: `${join(TUBERUN_DIR)}:${process.env.PATH}`,
+        PATH: `${TUBERUN_DIR}${PATH_SEPARATOR}${process.env.PATH}`,
       },
     })
 
@@ -141,7 +145,7 @@ async function downloadWithYtDlp(
         const downloadProcess = spawn(YTDLP_PATH, downloadArgs, {
           env: {
             ...process.env,
-            PATH: `${join(TUBERUN_DIR)}:${process.env.PATH}`,
+            PATH: `${TUBERUN_DIR}${PATH_SEPARATOR}${process.env.PATH}`,
             FFMPEG_PATH: FFMPEG_PATH,
           },
         })

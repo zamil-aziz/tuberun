@@ -1,29 +1,50 @@
 import { app, BrowserWindow } from 'electron'
 import { join } from 'path'
-import { existsSync, mkdirSync, chmodSync, createWriteStream } from 'fs'
+import { existsSync, mkdirSync, chmodSync, createWriteStream, readdirSync, copyFileSync, unlinkSync, rmSync } from 'fs'
 import { pipeline } from 'stream/promises'
-import { exec } from 'child_process'
-import { promisify } from 'util'
 import https from 'https'
+import extractZip from 'extract-zip'
 
-const execAsync = promisify(exec)
-
-// Get the TubeRun data directory
-export const TUBERUN_DIR = join(app.getPath('home'), '.tuberun')
-
-// Binary paths
-export const YTDLP_PATH = join(TUBERUN_DIR, 'yt-dlp')
-export const FFMPEG_PATH = join(TUBERUN_DIR, 'ffmpeg')
-export const DENO_PATH = join(TUBERUN_DIR, 'deno')
-
-// Download URLs (macOS)
-const YTDLP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos'
-const FFMPEG_URL = 'https://evermeet.cx/ffmpeg/getrelease/zip'
-const DENO_URL_ARM64 = 'https://github.com/denoland/deno/releases/latest/download/deno-aarch64-apple-darwin.zip'
-const DENO_URL_X64 = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-apple-darwin.zip'
-
-// Detect architecture
+// Platform detection
+const isWindows = process.platform === 'win32'
+const isMac = process.platform === 'darwin'
 const isArm64 = process.arch === 'arm64'
+
+// Get the TubeRun data directory (platform-specific)
+export const TUBERUN_DIR = isWindows
+  ? join(app.getPath('appData'), 'TubeRun')
+  : join(app.getPath('home'), '.tuberun')
+
+// Binary paths (with .exe extension on Windows)
+const EXE_EXT = isWindows ? '.exe' : ''
+export const YTDLP_PATH = join(TUBERUN_DIR, `yt-dlp${EXE_EXT}`)
+export const FFMPEG_PATH = join(TUBERUN_DIR, `ffmpeg${EXE_EXT}`)
+export const DENO_PATH = join(TUBERUN_DIR, `deno${EXE_EXT}`)
+
+// Download URLs - macOS
+const YTDLP_URL_MAC = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos'
+const FFMPEG_URL_MAC = 'https://evermeet.cx/ffmpeg/getrelease/zip'
+const DENO_URL_MAC_ARM64 = 'https://github.com/denoland/deno/releases/latest/download/deno-aarch64-apple-darwin.zip'
+const DENO_URL_MAC_X64 = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-apple-darwin.zip'
+
+// Download URLs - Windows
+const YTDLP_URL_WIN = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+const FFMPEG_URL_WIN = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+const DENO_URL_WIN_X64 = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip'
+
+// Get platform-specific URLs
+function getYtdlpUrl(): string {
+  return isWindows ? YTDLP_URL_WIN : YTDLP_URL_MAC
+}
+
+function getFfmpegUrl(): string {
+  return isWindows ? FFMPEG_URL_WIN : FFMPEG_URL_MAC
+}
+
+function getDenoUrl(): string {
+  if (isWindows) return DENO_URL_WIN_X64
+  return isArm64 ? DENO_URL_MAC_ARM64 : DENO_URL_MAC_X64
+}
 
 interface ProgressCallback {
   (step: string, percent: number, status: 'checking' | 'downloading' | 'complete' | 'error', error?: string): void
@@ -62,10 +83,13 @@ export async function downloadDependencies(
   // Download yt-dlp
   onProgress('yt-dlp', 0, 'downloading')
   try {
-    await downloadFile(YTDLP_URL, YTDLP_PATH, (percent) => {
+    await downloadFile(getYtdlpUrl(), YTDLP_PATH, (percent) => {
       onProgress('yt-dlp', percent, 'downloading')
     })
-    chmodSync(YTDLP_PATH, 0o755)
+    // Make executable on Unix systems
+    if (!isWindows) {
+      chmodSync(YTDLP_PATH, 0o755)
+    }
     onProgress('yt-dlp', 100, 'complete')
   } catch (error: any) {
     onProgress('yt-dlp', 0, 'error', error.message)
@@ -77,7 +101,7 @@ export async function downloadDependencies(
   try {
     const ffmpegArchive = join(TUBERUN_DIR, 'ffmpeg.zip')
 
-    await downloadFile(FFMPEG_URL, ffmpegArchive, (percent) => {
+    await downloadFile(getFfmpegUrl(), ffmpegArchive, (percent) => {
       onProgress('ffmpeg', percent * 0.8, 'downloading') // 80% for download
     })
 
@@ -93,10 +117,9 @@ export async function downloadDependencies(
   // Download Deno
   onProgress('deno', 0, 'downloading')
   try {
-    const denoUrl = isArm64 ? DENO_URL_ARM64 : DENO_URL_X64
     const denoArchive = join(TUBERUN_DIR, 'deno.zip')
 
-    await downloadFile(denoUrl, denoArchive, (percent) => {
+    await downloadFile(getDenoUrl(), denoArchive, (percent) => {
       onProgress('deno', percent * 0.8, 'downloading')
     })
 
@@ -157,7 +180,6 @@ async function downloadFile(
 }
 
 async function extractFFmpeg(archivePath: string): Promise<void> {
-  // Extract zip and find ffmpeg binary
   const extractDir = join(TUBERUN_DIR, 'ffmpeg-extract')
 
   // Create extract dir
@@ -165,27 +187,51 @@ async function extractFFmpeg(archivePath: string): Promise<void> {
     mkdirSync(extractDir, { recursive: true })
   }
 
-  // Extract using unzip
-  await execAsync(`unzip -o "${archivePath}" -d "${extractDir}"`)
+  // Extract using extract-zip (cross-platform)
+  await extractZip(archivePath, { dir: extractDir })
 
-  // Find and copy ffmpeg binary
-  const { stdout } = await execAsync(`find "${extractDir}" -name "ffmpeg" -type f`)
-  const ffmpegBinary = stdout.trim().split('\n')[0]
+  // Find ffmpeg binary (cross-platform)
+  const ffmpegBinary = findFileRecursive(extractDir, isWindows ? 'ffmpeg.exe' : 'ffmpeg')
 
   if (ffmpegBinary) {
-    await execAsync(`cp "${ffmpegBinary}" "${FFMPEG_PATH}"`)
-    chmodSync(FFMPEG_PATH, 0o755)
+    copyFileSync(ffmpegBinary, FFMPEG_PATH)
+    // Make executable on Unix systems
+    if (!isWindows) {
+      chmodSync(FFMPEG_PATH, 0o755)
+    }
   }
 
   // Cleanup
-  await execAsync(`rm -rf "${extractDir}" "${archivePath}"`)
+  rmSync(extractDir, { recursive: true, force: true })
+  unlinkSync(archivePath)
 }
 
 async function extractDeno(archivePath: string): Promise<void> {
-  // Extract zip
-  await execAsync(`unzip -o "${archivePath}" -d "${TUBERUN_DIR}"`)
-  chmodSync(DENO_PATH, 0o755)
+  // Extract using extract-zip (cross-platform)
+  await extractZip(archivePath, { dir: TUBERUN_DIR })
+
+  // Make executable on Unix systems
+  if (!isWindows) {
+    chmodSync(DENO_PATH, 0o755)
+  }
 
   // Cleanup
-  await execAsync(`rm -f "${archivePath}"`)
+  unlinkSync(archivePath)
+}
+
+// Helper function to recursively find a file by name
+function findFileRecursive(dir: string, filename: string): string | null {
+  const entries = readdirSync(dir, { withFileTypes: true })
+
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      const found = findFileRecursive(fullPath, filename)
+      if (found) return found
+    } else if (entry.name === filename) {
+      return fullPath
+    }
+  }
+
+  return null
 }
