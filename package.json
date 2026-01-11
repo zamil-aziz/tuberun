@@ -1,6 +1,6 @@
 {
   "name": "tuberun",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "YouTube to MP3 converter",
   "main": "out/main/index.js",
   "author": "TubeRun",
@@ -54,7 +54,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "resources/icon.ico"
