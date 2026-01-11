@@ -142,8 +142,8 @@ async function downloadFile(
     let currentUrl = url
 
     const handleResponse = (response: any) => {
-      // Handle redirects
-      if (response.statusCode === 301 || response.statusCode === 302) {
+      // Handle redirects (301, 302, 303, 307, 308)
+      if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
         const redirectUrl = response.headers.location
         // Resolve relative URLs against the current URL
         const resolvedUrl = new URL(redirectUrl, currentUrl).href
