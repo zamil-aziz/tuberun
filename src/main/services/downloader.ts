@@ -1,3 +1,4 @@
+import crypto from 'crypto'
 import { app, BrowserWindow } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import { join } from 'path'
