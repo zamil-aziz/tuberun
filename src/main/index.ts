@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { autoUpdater } from 'electron-updater'
@@ -78,6 +78,23 @@ app.whenReady().then(() => {
   // Check for updates (not in dev mode)
   if (!is.dev) {
     autoUpdater.checkForUpdatesAndNotify()
+
+    autoUpdater.on('update-downloaded', () => {
+      dialog.showMessageBox({
+        type: 'info',
+        title: 'Update Ready',
+        message: 'A new version has been downloaded. Restart now to update?',
+        buttons: ['Restart', 'Later']
+      }).then((result) => {
+        if (result.response === 0) {
+          autoUpdater.quitAndInstall()
+        }
+      })
+    })
+
+    autoUpdater.on('error', (err) => {
+      console.error('Auto-update error:', err)
+    })
   }
 
   app.on('activate', () => {

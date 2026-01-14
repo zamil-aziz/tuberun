@@ -36,6 +36,7 @@ jobs:
           name: TubeRun-Windows
           path: |
             release/*.exe
+            release/*.blockmap
             release/latest.yml
 
   release:

@@ -1,6 +1,6 @@
 {
   "name": "tuberun",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "YouTube to MP3 converter",
   "main": "out/main/index.js",
   "author": "TubeRun",
