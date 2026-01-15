@@ -78,7 +78,6 @@ export class DownloadQueueManager extends EventEmitter {
   private window: BrowserWindow | null = null
   private downloadFn: DownloadFunction | null = null
   private outputDir: string = ''
-  private processingQueue: boolean = false
 
   constructor(config: Partial<QueueConfig> = {}) {
     super()
@@ -204,21 +203,82 @@ export class DownloadQueueManager extends EventEmitter {
     return index >= 0 ? index + 1 : 0
   }
 
-  private async processQueue(): Promise<void> {
-    // Prevent concurrent processing
-    if (this.processingQueue) return
-    this.processingQueue = true
+  private processQueue(): void {
+    // Start downloads while we have capacity (non-blocking)
+    while (this.activeDownloads.size < this.config.maxConcurrent) {
+      const next = this.getNextQueuedDownload()
+      if (!next) break
 
-    try {
-      while (this.activeDownloads.size < this.config.maxConcurrent) {
-        const next = this.getNextQueuedDownload()
-        if (!next) break
+      // Mark as active immediately before starting
+      next.status = 'active'
+      next.startedAt = Date.now()
+      this.activeDownloads.add(next.id)
 
-        await this.startDownload(next)
-      }
-    } finally {
-      this.processingQueue = false
+      // Send initial 'downloading' status
+      this.sendProgress({
+        id: next.id,
+        status: 'downloading',
+        percent: 0,
+        title: next.title,
+      })
+
+      // Update queue positions for remaining items
+      this.updateQueuePositions()
+
+      // Start download asynchronously (fire-and-forget)
+      this.executeDownloadAsync(next)
     }
+  }
+
+  private executeDownloadAsync(download: QueuedDownload): void {
+    if (!this.downloadFn) {
+      console.error('Download function not set')
+      this.activeDownloads.delete(download.id)
+      download.status = 'error'
+      download.error = 'Download function not set'
+      return
+    }
+
+    this.downloadFn(
+      download.id,
+      download.url,
+      download.options,
+      download.options.outputDir || this.outputDir,
+      (progress) => this.sendProgress(progress),
+      {
+        maxRetries: download.maxRetries,
+        retryDelayBase: this.config.retryDelayBase,
+        timeout: this.config.downloadTimeout,
+      }
+    )
+      .then(() => {
+        download.status = 'completed'
+      })
+      .catch((error: any) => {
+        download.status = 'error'
+        download.error = error.message
+        this.sendProgress({
+          id: download.id,
+          status: 'error',
+          percent: 0,
+          error: error.message,
+        })
+      })
+      .finally(() => {
+        this.activeDownloads.delete(download.id)
+
+        // Remove completed/errored downloads from queue after a delay
+        const cleanupTimer = setTimeout(() => {
+          this.cleanupTimers.delete(download.id)
+          if (download.status === 'completed' || download.status === 'error') {
+            this.queue.delete(download.id)
+          }
+        }, 5000)
+        this.cleanupTimers.set(download.id, cleanupTimer)
+
+        // Process next in queue (may start more downloads if capacity available)
+        this.processQueue()
+      })
   }
 
   private getNextQueuedDownload(): QueuedDownload | null {
@@ -227,59 +287,6 @@ export class DownloadQueueManager extends EventEmitter {
       .sort((a, b) => b.priority - a.priority || a.addedAt - b.addedAt)
 
     return queued[0] || null
-  }
-
-  private async startDownload(download: QueuedDownload): Promise<void> {
-    if (!this.downloadFn) {
-      console.error('Download function not set')
-      return
-    }
-
-    download.status = 'active'
-    download.startedAt = Date.now()
-    this.activeDownloads.add(download.id)
-
-    // Update queue positions for all queued items
-    this.updateQueuePositions()
-
-    try {
-      await this.downloadFn(
-        download.id,
-        download.url,
-        download.options,
-        download.options.outputDir || this.outputDir,
-        (progress) => this.sendProgress(progress),
-        {
-          maxRetries: download.maxRetries,
-          retryDelayBase: this.config.retryDelayBase,
-          timeout: this.config.downloadTimeout,
-        }
-      )
-
-      download.status = 'completed'
-    } catch (error: any) {
-      download.status = 'error'
-      download.error = error.message
-      this.sendProgress({
-        id: download.id,
-        status: 'error',
-        percent: 0,
-        error: error.message,
-      })
-    } finally {
-      this.activeDownloads.delete(download.id)
-      // Remove completed/errored downloads from queue after a delay
-      const cleanupTimer = setTimeout(() => {
-        this.cleanupTimers.delete(download.id)
-        if (download.status === 'completed' || download.status === 'error') {
-          this.queue.delete(download.id)
-        }
-      }, 5000)
-      this.cleanupTimers.set(download.id, cleanupTimer)
-
-      // Process next in queue
-      this.processQueue()
-    }
   }
 
   private updateQueuePositions(): void {
