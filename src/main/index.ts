@@ -3,8 +3,10 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { autoUpdater } from 'electron-updater'
 import { checkDependencies, downloadDependencies } from './services/setup'
-import { startDownload, cancelDownload } from './services/downloader'
-import { getHistory, addToHistory, clearHistory } from './services/history'
+import { startDownload, cancelDownload, initializeDownloadQueue, killAllDownloads } from './services/downloader'
+import { getHistory, clearHistory } from './services/history'
+import { getDownloadSettings, updateDownloadSettings, DownloadSettings } from './services/settings'
+import { getDownloadQueue } from './services/downloadQueue'
 
 // Platform detection
 const isMac = process.platform === 'darwin'
@@ -19,6 +21,10 @@ function createWindow(): void {
     minWidth: 600,
     minHeight: 500,
     show: false,
+    // Window icon for Windows
+    ...(isWindows ? {
+      icon: join(__dirname, '../../resources/icon.ico'),
+    } : {}),
     // Platform-specific title bar styling
     ...(isMac ? {
       titleBarStyle: 'hiddenInset',
@@ -44,6 +50,17 @@ function createWindow(): void {
         ],
       },
     })
+  })
+
+  // Initialize download queue immediately after window creation
+  // This must happen before IPC handlers can be called
+  initializeDownloadQueue(mainWindow)
+  const settings = getDownloadSettings()
+  const queue = getDownloadQueue()
+  queue.updateConfig({
+    maxConcurrent: settings.maxConcurrentDownloads,
+    maxRetries: settings.autoRetry ? settings.maxRetries : 0,
+    downloadTimeout: settings.downloadTimeout * 1000,
   })
 
   mainWindow.on('ready-to-show', () => {
@@ -110,6 +127,13 @@ app.on('window-all-closed', () => {
   }
 })
 
+// Clean up download processes before quitting
+app.on('before-quit', () => {
+  killAllDownloads()
+  const queue = getDownloadQueue()
+  queue.cancelAll()
+})
+
 // =====================================
 // App IPC Handlers
 // =====================================
@@ -161,30 +185,51 @@ ipcMain.handle('setup:download-dependencies', async () => {
 // Download IPC Handlers
 // =====================================
 
-ipcMain.handle('download:start', async (_event, url: string, options: any) => {
+// Validate download options
+function validateDownloadOptions(options: unknown): { quality: '128' | '192' | '256' | '320'; speed: number; rateLimit?: number } {
+  const validQualities = ['128', '192', '256' , '320'] as const
+  const defaults = { quality: '320' as const, speed: 1 }
+
+  if (!options || typeof options !== 'object') {
+    return defaults
+  }
+
+  const opts = options as Record<string, unknown>
+  const quality = validQualities.includes(opts.quality as any)
+    ? (opts.quality as '128' | '192' | '256' | '320')
+    : defaults.quality
+  const speed = typeof opts.speed === 'number' && opts.speed > 0 && opts.speed <= 3
+    ? opts.speed
+    : defaults.speed
+
+  // Validate rateLimit (KB/s, 0 = unlimited, max 100000 KB/s)
+  const rateLimit = typeof opts.rateLimit === 'number' && opts.rateLimit >= 0 && opts.rateLimit <= 100000
+    ? opts.rateLimit
+    : undefined
+
+  return { quality, speed, rateLimit }
+}
+
+ipcMain.handle('download:start', async (_event, url: string, options: unknown) => {
   if (!mainWindow) {
     throw new Error('No main window')
   }
 
-  const id = await startDownload(mainWindow, url, options)
-
-  // Listen for completion to add to history
-  const progressHandler = (_e: any, progress: any) => {
-    if (progress.id === id && progress.status === 'complete') {
-      addToHistory({
-        id,
-        url,
-        title: progress.title,
-        outputPath: progress.outputPath,
-      })
-      mainWindow?.webContents.removeListener('download:progress', progressHandler)
-    }
+  // Validate URL
+  if (typeof url !== 'string' || !url.trim()) {
+    throw new Error('Invalid URL')
   }
 
-  // We need to set up a listener differently since we're in main process
-  // The history is added in the downloader service instead
+  const validatedOptions = validateDownloadOptions(options)
 
-  return id
+  // Apply bandwidth limit from settings if not explicitly set
+  const settings = getDownloadSettings()
+  const downloadOptions = {
+    ...validatedOptions,
+    rateLimit: validatedOptions.rateLimit ?? settings.bandwidthLimit
+  }
+
+  return await startDownload(mainWindow, url, downloadOptions)
 })
 
 ipcMain.handle('download:cancel', async (_event, id: string) => {
@@ -201,4 +246,38 @@ ipcMain.handle('history:get', async () => {
 
 ipcMain.handle('history:clear', async () => {
   clearHistory()
+})
+
+// =====================================
+// Settings IPC Handlers
+// =====================================
+
+ipcMain.handle('settings:get-download', async () => {
+  return getDownloadSettings()
+})
+
+ipcMain.handle('settings:update-download', async (_event, settings: Partial<DownloadSettings>) => {
+  const updated = updateDownloadSettings(settings)
+  // Update queue config when settings change
+  const queue = getDownloadQueue()
+  queue.updateConfig({
+    maxConcurrent: updated.maxConcurrentDownloads,
+    maxRetries: updated.autoRetry ? updated.maxRetries : 0,
+    downloadTimeout: updated.downloadTimeout * 1000,
+  })
+  return updated
+})
+
+// =====================================
+// Queue IPC Handlers
+// =====================================
+
+ipcMain.handle('queue:get-status', async () => {
+  const queue = getDownloadQueue()
+  return queue.getQueueStatus()
+})
+
+ipcMain.handle('queue:cancel-all', async () => {
+  const queue = getDownloadQueue()
+  queue.cancelAll()
 })

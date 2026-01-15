@@ -7,7 +7,7 @@ interface SetupProgressProps {
 interface SetupStep {
   id: string
   label: string
-  status: 'pending' | 'downloading' | 'complete' | 'error'
+  status: 'pending' | 'checking' | 'downloading' | 'complete' | 'error'
 }
 
 function SetupProgress({ onComplete }: SetupProgressProps) {

@@ -7,7 +7,6 @@ import extractZip from 'extract-zip'
 
 // Platform detection
 const isWindows = process.platform === 'win32'
-const isMac = process.platform === 'darwin'
 const isArm64 = process.arch === 'arm64'
 
 // Get the TubeRun data directory (platform-specific)
@@ -31,6 +30,22 @@ const DENO_URL_MAC_X64 = 'https://github.com/denoland/deno/releases/latest/downl
 const YTDLP_URL_WIN = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
 const FFMPEG_URL_WIN = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
 const DENO_URL_WIN_X64 = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip'
+
+// Connection pool for faster downloads
+const downloadAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 6,
+  maxFreeSockets: 2,
+  timeout: 120000,
+})
+
+// Retry configuration
+const RETRY_CONFIG = {
+  maxRetries: 3,
+  retryDelayBase: 1000,
+  timeout: 120000, // 2 minutes per download
+}
 
 // Get platform-specific URLs
 function getYtdlpUrl(): string {
@@ -71,8 +86,14 @@ export async function checkDependencies(): Promise<{ ready: boolean; missing: st
   }
 }
 
+// Sleep helper for retry delays
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// Main download function - now downloads in parallel
 export async function downloadDependencies(
-  window: BrowserWindow,
+  _window: BrowserWindow,
   onProgress: ProgressCallback
 ): Promise<void> {
   // Ensure directory exists
@@ -80,57 +101,185 @@ export async function downloadDependencies(
     mkdirSync(TUBERUN_DIR, { recursive: true })
   }
 
-  // Download yt-dlp
-  onProgress('yt-dlp', 0, 'downloading')
-  try {
-    await downloadFile(getYtdlpUrl(), YTDLP_PATH, (percent) => {
-      onProgress('yt-dlp', percent, 'downloading')
-    })
-    // Make executable on Unix systems
-    if (!isWindows) {
-      chmodSync(YTDLP_PATH, 0o755)
+  // Track individual progress for combined display
+  const progressState = new Map<string, number>([
+    ['yt-dlp', 0],
+    ['ffmpeg', 0],
+    ['deno', 0],
+  ])
+
+  // Create individual progress handlers
+  const createProgressHandler = (step: string) => (percent: number) => {
+    progressState.set(step, percent)
+    onProgress(step, percent, 'downloading')
+  }
+
+  // Start all downloads in parallel
+  const downloadPromises = [
+    downloadYtDlpWithRetry(createProgressHandler('yt-dlp'))
+      .then(() => {
+        onProgress('yt-dlp', 100, 'complete')
+      })
+      .catch((error) => {
+        onProgress('yt-dlp', 0, 'error', error.message)
+        throw error
+      }),
+
+    downloadFFmpegWithRetry(createProgressHandler('ffmpeg'))
+      .then(() => {
+        onProgress('ffmpeg', 100, 'complete')
+      })
+      .catch((error) => {
+        onProgress('ffmpeg', 0, 'error', error.message)
+        throw error
+      }),
+
+    downloadDenoWithRetry(createProgressHandler('deno'))
+      .then(() => {
+        onProgress('deno', 100, 'complete')
+      })
+      .catch((error) => {
+        onProgress('deno', 0, 'error', error.message)
+        throw error
+      }),
+  ]
+
+  // Wait for all downloads to complete
+  const results = await Promise.allSettled(downloadPromises)
+
+  // Check for failures
+  const failures = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+  if (failures.length > 0) {
+    throw failures[0].reason
+  }
+}
+
+// Individual download functions with retry logic
+async function downloadYtDlpWithRetry(onProgress: (percent: number) => void): Promise<void> {
+  return downloadWithRetry({
+    url: getYtdlpUrl(),
+    destPath: YTDLP_PATH,
+    name: 'yt-dlp',
+    onProgress,
+    postProcess: () => {
+      if (!isWindows) {
+        chmodSync(YTDLP_PATH, 0o755)
+      }
+    },
+  })
+}
+
+async function downloadFFmpegWithRetry(onProgress: (percent: number) => void): Promise<void> {
+  const archivePath = join(TUBERUN_DIR, 'ffmpeg.zip')
+
+  await downloadWithRetry({
+    url: getFfmpegUrl(),
+    destPath: archivePath,
+    name: 'ffmpeg',
+    onProgress: (p) => onProgress(p * 0.8), // 80% for download
+    postProcess: async () => {
+      onProgress(80)
+      await extractFFmpeg(archivePath)
+    },
+  })
+}
+
+async function downloadDenoWithRetry(onProgress: (percent: number) => void): Promise<void> {
+  const archivePath = join(TUBERUN_DIR, 'deno.zip')
+
+  await downloadWithRetry({
+    url: getDenoUrl(),
+    destPath: archivePath,
+    name: 'deno',
+    onProgress: (p) => onProgress(p * 0.8),
+    postProcess: async () => {
+      onProgress(80)
+      await extractDeno(archivePath)
+    },
+  })
+}
+
+interface DownloadWithRetryOptions {
+  url: string
+  destPath: string
+  name: string
+  onProgress: (percent: number) => void
+  postProcess?: () => void | Promise<void>
+}
+
+async function downloadWithRetry(options: DownloadWithRetryOptions): Promise<void> {
+  let lastError: Error | null = null
+
+  for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        const delay = RETRY_CONFIG.retryDelayBase * Math.pow(2, attempt - 1)
+        await sleep(delay)
+      }
+
+      await downloadFileWithTimeout(options.url, options.destPath, options.onProgress)
+
+      // Run post-processing if provided
+      if (options.postProcess) {
+        await options.postProcess()
+      }
+
+      return // Success
+    } catch (error: any) {
+      lastError = error
+
+      // Check if error is retryable
+      if (!isRetryableError(error)) {
+        throw error
+      }
+
+      // If we've exhausted retries, throw
+      if (attempt === RETRY_CONFIG.maxRetries) {
+        throw new Error(`Failed to download ${options.name} after ${RETRY_CONFIG.maxRetries + 1} attempts: ${error.message}`)
+      }
     }
-    onProgress('yt-dlp', 100, 'complete')
-  } catch (error: any) {
-    onProgress('yt-dlp', 0, 'error', error.message)
-    throw error
   }
 
-  // Download FFmpeg
-  onProgress('ffmpeg', 0, 'downloading')
-  try {
-    const ffmpegArchive = join(TUBERUN_DIR, 'ffmpeg.zip')
+  throw lastError || new Error(`Failed to download ${options.name}`)
+}
 
-    await downloadFile(getFfmpegUrl(), ffmpegArchive, (percent) => {
-      onProgress('ffmpeg', percent * 0.8, 'downloading') // 80% for download
-    })
+function isRetryableError(error: any): boolean {
+  const message = error.message || String(error)
+  const retryablePatterns = [
+    /network/i,
+    /timeout/i,
+    /ECONNRESET/,
+    /ETIMEDOUT/,
+    /ENOTFOUND/,
+    /socket hang up/i,
+    /temporarily unavailable/i,
+    /429/,
+    /503/,
+  ]
+  return retryablePatterns.some(p => p.test(message))
+}
 
-    // Extract ffmpeg
-    onProgress('ffmpeg', 80, 'downloading')
-    await extractFFmpeg(ffmpegArchive)
-    onProgress('ffmpeg', 100, 'complete')
-  } catch (error: any) {
-    onProgress('ffmpeg', 0, 'error', error.message)
-    throw error
-  }
+async function downloadFileWithTimeout(
+  url: string,
+  destPath: string,
+  onProgress: (percent: number) => void
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // Set overall timeout
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`Download timed out after ${RETRY_CONFIG.timeout / 1000}s`))
+    }, RETRY_CONFIG.timeout)
 
-  // Download Deno
-  onProgress('deno', 0, 'downloading')
-  try {
-    const denoArchive = join(TUBERUN_DIR, 'deno.zip')
-
-    await downloadFile(getDenoUrl(), denoArchive, (percent) => {
-      onProgress('deno', percent * 0.8, 'downloading')
-    })
-
-    // Extract deno
-    onProgress('deno', 80, 'downloading')
-    await extractDeno(denoArchive)
-    onProgress('deno', 100, 'complete')
-  } catch (error: any) {
-    onProgress('deno', 0, 'error', error.message)
-    throw error
-  }
+    downloadFile(url, destPath, onProgress)
+      .then(() => {
+        clearTimeout(timeoutId)
+        resolve()
+      })
+      .catch((error) => {
+        clearTimeout(timeoutId)
+        reject(error)
+      })
+  })
 }
 
 async function downloadFile(
@@ -148,7 +297,7 @@ async function downloadFile(
         // Resolve relative URLs against the current URL
         const resolvedUrl = new URL(redirectUrl, currentUrl).href
         currentUrl = resolvedUrl
-        https.get(resolvedUrl, handleResponse).on('error', reject)
+        https.get(resolvedUrl, { agent: downloadAgent }, handleResponse).on('error', reject)
         return
       }
 
@@ -175,7 +324,7 @@ async function downloadFile(
         .catch(reject)
     }
 
-    https.get(url, handleResponse).on('error', reject)
+    https.get(url, { agent: downloadAgent }, handleResponse).on('error', reject)
   })
 }
 
