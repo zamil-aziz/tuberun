@@ -129,8 +129,12 @@ app.on('window-all-closed', () => {
 
 // Clean up download processes before quitting
 app.on('before-quit', () => {
+  // Kill all active downloads
   killAllDownloads()
+
+  // Clear queue and timers
   const queue = getDownloadQueue()
+  queue.clearAllTimers()
   queue.cancelAll()
 })
 
@@ -151,11 +155,27 @@ ipcMain.handle('app:get-path', (_event, name: string) => {
 // =====================================
 
 ipcMain.handle('shell:open-path', async (_event, path: string) => {
-  return shell.openPath(path)
+  try {
+    if (!path || typeof path !== 'string') {
+      throw new Error('Invalid path')
+    }
+    return await shell.openPath(path)
+  } catch (error: any) {
+    console.error('Failed to open path:', error)
+    throw new Error(`Failed to open path: ${error.message}`)
+  }
 })
 
-ipcMain.handle('shell:show-item-in-folder', (_event, path: string) => {
-  shell.showItemInFolder(path)
+ipcMain.handle('shell:show-item-in-folder', async (_event, path: string) => {
+  try {
+    if (!path || typeof path !== 'string') {
+      throw new Error('Invalid path')
+    }
+    shell.showItemInFolder(path)
+  } catch (error: any) {
+    console.error('Failed to show item in folder:', error)
+    throw new Error(`Failed to show item in folder: ${error.message}`)
+  }
 })
 
 // =====================================
@@ -172,12 +192,19 @@ ipcMain.handle('setup:download-dependencies', async () => {
   }
 
   await downloadDependencies(mainWindow, (step, percent, status, error) => {
-    mainWindow?.webContents.send('setup:progress', {
-      step,
-      percent,
-      status,
-      error,
-    })
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('setup:progress', {
+          step,
+          percent,
+          status,
+          error,
+        })
+      }
+    } catch (err) {
+      // Window may have been destroyed between check and send
+      console.error('Failed to send setup progress:', err)
+    }
   })
 })
 

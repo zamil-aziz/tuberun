@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 
 interface SetupProgressProps {
   onComplete: () => void
@@ -14,11 +14,11 @@ function SetupProgress({ onComplete }: SetupProgressProps) {
   const [steps, setSteps] = useState<SetupStep[]>([
     { id: 'yt-dlp', label: 'yt-dlp', status: 'pending' },
     { id: 'ffmpeg', label: 'FFmpeg', status: 'pending' },
-    { id: 'deno', label: 'Deno', status: 'pending' },
   ])
   const [error, setError] = useState<string | null>(null)
   const [currentStep, setCurrentStep] = useState<string | null>(null)
   const [percent, setPercent] = useState(0)
+  const completionTimeoutRef = useRef<NodeJS.Timeout | null>(null)
 
   useEffect(() => {
     startSetup()
@@ -40,13 +40,23 @@ function SetupProgress({ onComplete }: SetupProgressProps) {
         setError(progress.error)
       }
 
-      // Check if all complete
-      if (progress.step === 'deno' && progress.status === 'complete') {
-        setTimeout(onComplete, 500)
+      // Check if all complete (ffmpeg is the last required dependency)
+      if (progress.step === 'ffmpeg' && progress.status === 'complete') {
+        // Clear any existing timeout before setting a new one
+        if (completionTimeoutRef.current) {
+          clearTimeout(completionTimeoutRef.current)
+        }
+        completionTimeoutRef.current = setTimeout(onComplete, 500)
       }
     })
 
-    return unsubscribe
+    return () => {
+      unsubscribe()
+      // Clean up timeout on unmount
+      if (completionTimeoutRef.current) {
+        clearTimeout(completionTimeoutRef.current)
+      }
+    }
   }, [onComplete])
 
   const startSetup = async () => {

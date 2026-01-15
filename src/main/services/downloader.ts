@@ -2,8 +2,9 @@ import crypto from 'crypto'
 import { app, BrowserWindow } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import { join } from 'path'
-import { existsSync, mkdirSync } from 'fs'
-import ffmpeg from 'fluent-ffmpeg'
+import { existsSync, mkdirSync, statfsSync } from 'fs'
+import { unlink } from 'fs/promises'
+import ffmpeg, { FfmpegCommand } from 'fluent-ffmpeg'
 import { YTDLP_PATH, FFMPEG_PATH, TUBERUN_DIR } from './setup'
 import { addToHistory } from './history'
 import { getDownloadQueue, EnhancedDownloadProgress, DownloadOptions } from './downloadQueue'
@@ -15,8 +16,20 @@ const PATH_SEPARATOR = isWindows ? ';' : ':'
 // Output directory
 const OUTPUT_DIR = join(app.getPath('downloads'), 'TubeRun')
 
+// Minimum required disk space (500MB)
+const MIN_DISK_SPACE_BYTES = 500 * 1024 * 1024
+
 // Active download processes (for cancellation)
 const activeProcesses = new Map<string, ChildProcess>()
+
+// Active FFmpeg processes (for cancellation during speed adjustment)
+const activeFFmpegCommands = new Map<string, FfmpegCommand>()
+
+// Track processed downloads to prevent double-handling
+const processedDownloads = new Set<string>()
+
+// Windows reserved filenames
+const WINDOWS_RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i
 
 // Re-export types
 export type { DownloadOptions, EnhancedDownloadProgress }
@@ -52,6 +65,45 @@ export function initializeDownloadQueue(window: BrowserWindow): void {
   queue.setDownloadFunction(executeDownloadWithRetry)
 }
 
+// Check available disk space
+function checkDiskSpace(path: string): { available: number; sufficient: boolean } {
+  try {
+    const stats = statfsSync(path)
+    const available = stats.bavail * stats.bsize
+    return {
+      available,
+      sufficient: available >= MIN_DISK_SPACE_BYTES
+    }
+  } catch {
+    // If we can't check, assume it's sufficient
+    return { available: 0, sufficient: true }
+  }
+}
+
+// Sanitize filename for all platforms
+function sanitizeFilename(filename: string): string {
+  // Remove/replace invalid characters
+  let safe = filename.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+
+  // Handle Windows reserved names
+  if (isWindows && WINDOWS_RESERVED_NAMES.test(safe.split('.')[0])) {
+    safe = '_' + safe
+  }
+
+  // Limit length (leaving room for extension and temp suffix)
+  safe = safe.substring(0, 80)
+
+  // Remove trailing dots and spaces (Windows issue)
+  safe = safe.replace(/[. ]+$/, '')
+
+  // Ensure non-empty
+  if (!safe) {
+    safe = 'download'
+  }
+
+  return safe
+}
+
 // Main entry point for starting a download (used by IPC handler)
 export async function startDownload(
   _window: BrowserWindow,
@@ -61,9 +113,19 @@ export async function startDownload(
   const id = crypto.randomUUID()
   const outputDir = options.outputDir || OUTPUT_DIR
 
-  // Ensure output directory exists
-  if (!existsSync(outputDir)) {
-    mkdirSync(outputDir, { recursive: true })
+  // Ensure output directory exists with error handling
+  try {
+    if (!existsSync(outputDir)) {
+      mkdirSync(outputDir, { recursive: true })
+    }
+  } catch (error: any) {
+    throw new Error(`Cannot create download directory: ${error.message}`)
+  }
+
+  // Check disk space
+  const diskSpace = checkDiskSpace(outputDir)
+  if (!diskSpace.sufficient) {
+    throw new Error(`Insufficient disk space. Need at least 500MB free.`)
   }
 
   // Add to queue
@@ -75,10 +137,23 @@ export async function startDownload(
 
 // Cancel a download
 export function cancelDownload(id: string): void {
+  // Kill yt-dlp process
   const process = activeProcesses.get(id)
   if (process) {
-    process.kill('SIGTERM')
+    // Use SIGKILL on Windows (SIGTERM doesn't work reliably)
+    process.kill(isWindows ? 'SIGKILL' : 'SIGTERM')
     activeProcesses.delete(id)
+  }
+
+  // Kill FFmpeg process if active
+  const ffmpegCommand = activeFFmpegCommands.get(id)
+  if (ffmpegCommand) {
+    try {
+      ffmpegCommand.kill('SIGKILL')
+    } catch {
+      // Ignore errors when killing FFmpeg
+    }
+    activeFFmpegCommands.delete(id)
   }
 
   // Also remove from queue
@@ -88,14 +163,28 @@ export function cancelDownload(id: string): void {
 
 // Kill all active download processes (used on app exit)
 export function killAllDownloads(): void {
-  const ids = Array.from(activeProcesses.keys())
-  for (const id of ids) {
-    const process = activeProcesses.get(id)
-    if (process) {
-      process.kill('SIGTERM')
-      activeProcesses.delete(id)
+  // Kill all yt-dlp processes
+  for (const [id, process] of activeProcesses) {
+    try {
+      process.kill(isWindows ? 'SIGKILL' : 'SIGTERM')
+    } catch {
+      // Ignore errors
     }
+    activeProcesses.delete(id)
   }
+
+  // Kill all FFmpeg processes
+  for (const [id, command] of activeFFmpegCommands) {
+    try {
+      command.kill('SIGKILL')
+    } catch {
+      // Ignore errors
+    }
+    activeFFmpegCommands.delete(id)
+  }
+
+  // Clear processed set
+  processedDownloads.clear()
 }
 
 // Classify errors for better user feedback and retry decisions
@@ -115,7 +204,7 @@ function classifyError(error: string): ClassifiedError {
       'The download timed out. Please check your connection and try again', true],
     [/network|ECONNRESET|ECONNREFUSED|ENOTFOUND|socket hang up/i, DownloadErrorType.NETWORK,
       'Network error. Please check your connection and try again', true],
-    [/cancelled|aborted|SIGTERM/i, DownloadErrorType.CANCELLED,
+    [/cancelled|aborted|SIGTERM|SIGKILL/i, DownloadErrorType.CANCELLED,
       'Download was cancelled', false],
     [/ffmpeg|encoding|conversion/i, DownloadErrorType.FFMPEG_ERROR,
       'Audio conversion failed', false],
@@ -129,14 +218,16 @@ function classifyError(error: string): ClassifiedError {
 
   return {
     type: DownloadErrorType.UNKNOWN,
-    userMessage: error.length > 100 ? error.substring(0, 100) + '...' : error,
+    userMessage: error.length > 200 ? error.substring(0, 200) + '...' : error,
     retryable: false
   }
 }
 
-// Sleep helper
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+// Sleep helper with jitter for retry delays
+function sleepWithJitter(baseMs: number): Promise<void> {
+  // Add 0-50% random jitter to prevent thundering herd
+  const jitter = Math.random() * 0.5 * baseMs
+  return new Promise(resolve => setTimeout(resolve, baseMs + jitter))
 }
 
 // Timeout wrapper
@@ -162,6 +253,18 @@ function withTimeout<T>(
   })
 }
 
+// Clean up temp files
+async function cleanupTempFiles(outputDir: string, safeTitle: string): Promise<void> {
+  const tempFile = join(outputDir, `${safeTitle}_temp.mp3`)
+  try {
+    if (existsSync(tempFile)) {
+      await unlink(tempFile)
+    }
+  } catch {
+    // Ignore cleanup errors
+  }
+}
+
 // Download with retry logic
 async function executeDownloadWithRetry(
   id: string,
@@ -184,7 +287,7 @@ async function executeDownloadWithRetry(
           retryCount: attempt,
           maxRetries: config.maxRetries,
         })
-        await sleep(delay)
+        await sleepWithJitter(delay)
       }
 
       await withTimeout(
@@ -212,6 +315,17 @@ async function executeDownloadWithRetry(
   throw lastError || new Error('Download failed after retries')
 }
 
+// Map quality option to bitrate
+function qualityToBitrate(quality: string): string {
+  switch (quality) {
+    case '320': return '320k'
+    case '256': return '256k'
+    case '192': return '192k'
+    case '128': return '128k'
+    default: return '192k'
+  }
+}
+
 // Core download execution
 async function executeDownload(
   id: string,
@@ -221,6 +335,22 @@ async function executeDownload(
   onProgress: (progress: EnhancedDownloadProgress) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
+    // Track if this download has been processed
+    if (processedDownloads.has(id)) {
+      reject(new Error('Download already processed'))
+      return
+    }
+
+    let hasCompleted = false
+    const markComplete = (success: boolean = false) => {
+      if (hasCompleted) return false
+      hasCompleted = true
+      if (success) {
+        processedDownloads.add(id)
+      }
+      return true
+    }
+
     // First, get video info with timeout
     const infoArgs = [
       '--dump-json',
@@ -239,11 +369,12 @@ async function executeDownload(
     let infoError = ''
     let videoTitle = 'Unknown'
     let infoTimedOut = false
+    let safeTitle = 'download'
 
     // Timeout for info fetch (30 seconds should be plenty for metadata)
     const infoTimeout = setTimeout(() => {
       infoTimedOut = true
-      infoProcess.kill('SIGTERM')
+      infoProcess.kill(isWindows ? 'SIGKILL' : 'SIGTERM')
     }, 30000)
 
     infoProcess.stdout.on('data', (data) => {
@@ -261,12 +392,16 @@ async function executeDownload(
       clearTimeout(infoTimeout)
 
       if (infoTimedOut) {
-        reject(new Error('Fetching video info timed out. Please try again.'))
+        if (markComplete()) {
+          reject(new Error('Fetching video info timed out. Please try again.'))
+        }
         return
       }
       if (code !== 0) {
-        const errorMsg = infoError || 'Failed to get video info'
-        reject(new Error(errorMsg))
+        if (markComplete()) {
+          const errorMsg = infoError || 'Failed to get video info'
+          reject(new Error(errorMsg))
+        }
         return
       }
 
@@ -281,8 +416,8 @@ async function executeDownload(
           title: videoTitle,
         })
 
-        // Sanitize filename
-        const safeTitle = videoTitle.replace(/[<>:"/\\|?*]/g, '_').substring(0, 100)
+        // Sanitize filename properly
+        safeTitle = sanitizeFilename(videoTitle)
         const tempFile = join(outputDir, `${safeTitle}_temp.%(ext)s`)
         const outputFile = join(outputDir, `${safeTitle}.mp3`)
 
@@ -321,10 +456,10 @@ async function executeDownload(
             /(\d+(?:\.\d+)?)%(?:\s+of\s+[\d.]+\w+)?\s+at\s+([\d.]+\s*\w+\/s)(?:\s+ETA\s+(\d+:\d+))?/
           )
 
-          if (progressMatch) {
+          if (progressMatch && progressMatch[1]) {
             const percent = parseFloat(progressMatch[1])
-            const speed = progressMatch[2]?.trim()
-            const eta = progressMatch[3]
+            const speed = progressMatch[2]?.trim() || undefined
+            const eta = progressMatch[3] || undefined
 
             onProgress({
               id,
@@ -337,7 +472,7 @@ async function executeDownload(
           } else {
             // Fallback: just parse percent
             const percentMatch = line.match(/(\d+(?:\.\d+)?)%/)
-            if (percentMatch) {
+            if (percentMatch && percentMatch[1]) {
               const percent = parseFloat(percentMatch[1])
               onProgress({
                 id,
@@ -361,7 +496,10 @@ async function executeDownload(
           activeProcesses.delete(id)
 
           if (downloadCode !== 0) {
-            reject(new Error(downloadError || 'Download failed'))
+            if (markComplete()) {
+              await cleanupTempFiles(outputDir, safeTitle)
+              reject(new Error(downloadError || 'Download failed'))
+            }
             return
           }
 
@@ -378,17 +516,23 @@ async function executeDownload(
             })
 
             try {
-              await adjustSpeed(downloadedFile, outputFile, options.speed, (percent) => {
-                onProgress({
-                  id,
-                  status: 'converting',
-                  percent: 70 + percent * 0.3,
-                  title: videoTitle,
-                })
-              })
+              await adjustSpeed(
+                id,
+                downloadedFile,
+                outputFile,
+                options.speed,
+                options.quality,
+                (percent) => {
+                  onProgress({
+                    id,
+                    status: 'converting',
+                    percent: 70 + percent * 0.3,
+                    title: videoTitle,
+                  })
+                }
+              )
 
               // Remove temp file
-              const { unlink } = await import('fs/promises')
               await unlink(downloadedFile)
 
               // Add to history
@@ -399,22 +543,35 @@ async function executeDownload(
                 outputPath: outputFile,
               })
 
-              onProgress({
-                id,
-                status: 'complete',
-                percent: 100,
-                title: videoTitle,
-                outputPath: outputFile,
-              })
-              resolve()
+              if (markComplete(true)) {
+                onProgress({
+                  id,
+                  status: 'complete',
+                  percent: 100,
+                  title: videoTitle,
+                  outputPath: outputFile,
+                })
+                resolve()
+              }
             } catch (err: any) {
-              reject(new Error(`Speed adjustment failed: ${err.message}`))
+              if (markComplete()) {
+                // Clean up temp files on failure
+                await cleanupTempFiles(outputDir, safeTitle)
+                reject(new Error(`Speed adjustment failed: ${err.message}`))
+              }
             }
           } else {
             // Rename temp file to final
             if (existsSync(downloadedFile)) {
               const { rename } = await import('fs/promises')
-              await rename(downloadedFile, outputFile)
+              try {
+                await rename(downloadedFile, outputFile)
+              } catch (err: any) {
+                if (markComplete()) {
+                  reject(new Error(`Failed to save file: ${err.message}`))
+                }
+                return
+              }
             }
 
             // Add to history
@@ -425,43 +582,54 @@ async function executeDownload(
               outputPath: outputFile,
             })
 
-            onProgress({
-              id,
-              status: 'complete',
-              percent: 100,
-              title: videoTitle,
-              outputPath: outputFile,
-            })
-            resolve()
+            if (markComplete(true)) {
+              onProgress({
+                id,
+                status: 'complete',
+                percent: 100,
+                title: videoTitle,
+                outputPath: outputFile,
+              })
+              resolve()
+            }
           }
         })
 
-        downloadProcess.on('error', (err) => {
+        downloadProcess.on('error', async (err) => {
           activeProcesses.delete(id)
-          reject(new Error(`Download process error: ${err.message}`))
+          if (markComplete()) {
+            await cleanupTempFiles(outputDir, safeTitle)
+            reject(new Error(`Download process error: ${err.message}`))
+          }
         })
       } catch (err: any) {
-        reject(new Error(`Failed to parse video info: ${err.message}`))
+        if (markComplete()) {
+          reject(new Error(`Failed to parse video info: ${err.message}`))
+        }
       }
     })
 
     infoProcess.on('error', (err) => {
       clearTimeout(infoTimeout)
-      reject(new Error(`Failed to start yt-dlp: ${err.message}`))
+      if (markComplete()) {
+        reject(new Error(`Failed to start yt-dlp: ${err.message}`))
+      }
     })
   })
 }
 
 function adjustSpeed(
+  id: string,
   inputFile: string,
   outputFile: string,
   speed: number,
+  quality: string,
   onProgress: (percent: number) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     // Calculate atempo value (ffmpeg atempo accepts 0.5 to 2.0)
     // For speeds > 2, we need to chain multiple atempo filters
-    let atempoFilters: string[] = []
+    const atempoFilters: string[] = []
     let remainingSpeed = speed
 
     while (remainingSpeed > 2.0) {
@@ -476,34 +644,66 @@ function adjustSpeed(
 
     let duration = 0
 
-    ffmpeg(inputFile)
+    const command = ffmpeg(inputFile)
       .audioFilters(filterString)
-      .audioBitrate('320k')
+      .audioBitrate(qualityToBitrate(quality))
       .on('codecData', (data) => {
-        // Parse duration
-        const parts = data.duration.split(':')
-        duration = parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2])
+        // Parse duration with validation
+        if (data.duration) {
+          duration = parseDuration(data.duration)
+        }
       })
       .on('progress', (progress) => {
-        if (duration > 0) {
-          const percent = Math.min((progress.timemark ? parseTimemark(progress.timemark) / duration : 0) * 100, 100)
+        if (duration > 0 && progress.timemark) {
+          const currentTime = parseTimemark(progress.timemark)
+          const percent = Math.min((currentTime / duration) * 100, 100)
           onProgress(percent)
         }
       })
       .on('end', () => {
+        activeFFmpegCommands.delete(id)
         resolve()
       })
       .on('error', (err) => {
+        activeFFmpegCommands.delete(id)
         reject(err)
       })
-      .save(outputFile)
+
+    // Track FFmpeg command for cancellation
+    activeFFmpegCommands.set(id, command)
+
+    command.save(outputFile)
   })
 }
 
-function parseTimemark(timemark: string): number {
-  const parts = timemark.split(':')
-  if (parts.length === 3) {
-    return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2])
+// Parse duration string with validation
+function parseDuration(duration: string): number {
+  if (!duration || typeof duration !== 'string') {
+    return 0
   }
+
+  const parts = duration.split(':')
+
+  // Handle different formats
+  if (parts.length === 3) {
+    const hours = parseFloat(parts[0]) || 0
+    const minutes = parseFloat(parts[1]) || 0
+    const seconds = parseFloat(parts[2]) || 0
+    return hours * 3600 + minutes * 60 + seconds
+  } else if (parts.length === 2) {
+    const minutes = parseFloat(parts[0]) || 0
+    const seconds = parseFloat(parts[1]) || 0
+    return minutes * 60 + seconds
+  } else if (parts.length === 1) {
+    return parseFloat(parts[0]) || 0
+  }
+
   return 0
+}
+
+function parseTimemark(timemark: string): number {
+  if (!timemark || typeof timemark !== 'string') {
+    return 0
+  }
+  return parseDuration(timemark)
 }

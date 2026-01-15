@@ -239,29 +239,48 @@ export class DownloadQueueManager extends EventEmitter {
       return
     }
 
-    this.downloadFn(
-      download.id,
-      download.url,
-      download.options,
-      download.options.outputDir || this.outputDir,
-      (progress) => this.sendProgress(progress),
-      {
-        maxRetries: download.maxRetries,
-        retryDelayBase: this.config.retryDelayBase,
-        timeout: this.config.downloadTimeout,
-      }
-    )
+    // Wrap in try-catch to handle synchronous errors from the download function
+    let downloadPromise: Promise<void>
+    try {
+      downloadPromise = this.downloadFn(
+        download.id,
+        download.url,
+        download.options,
+        download.options.outputDir || this.outputDir,
+        (progress) => this.sendProgress(progress),
+        {
+          maxRetries: download.maxRetries,
+          retryDelayBase: this.config.retryDelayBase,
+          timeout: this.config.downloadTimeout,
+        }
+      )
+    } catch (error: any) {
+      // Handle synchronous errors
+      this.activeDownloads.delete(download.id)
+      download.status = 'error'
+      download.error = error.message || 'Download failed to start'
+      this.sendProgress({
+        id: download.id,
+        status: 'error',
+        percent: 0,
+        error: download.error,
+      })
+      this.processQueue()
+      return
+    }
+
+    downloadPromise
       .then(() => {
         download.status = 'completed'
       })
       .catch((error: any) => {
         download.status = 'error'
-        download.error = error.message
+        download.error = error.message || 'Download failed'
         this.sendProgress({
           id: download.id,
           status: 'error',
           percent: 0,
-          error: error.message,
+          error: download.error,
         })
       })
       .finally(() => {
@@ -306,10 +325,23 @@ export class DownloadQueueManager extends EventEmitter {
   }
 
   private sendProgress(progress: EnhancedDownloadProgress): void {
-    if (this.window && !this.window.isDestroyed()) {
-      this.window.webContents.send('download:progress', progress)
+    try {
+      if (this.window && !this.window.isDestroyed()) {
+        this.window.webContents.send('download:progress', progress)
+      }
+    } catch (error) {
+      // Window may have been destroyed between check and send
+      console.error('Failed to send progress:', error)
     }
     this.emit('progress', progress)
+  }
+
+  // Clear all cleanup timers (call on app exit)
+  clearAllTimers(): void {
+    for (const timer of this.cleanupTimers.values()) {
+      clearTimeout(timer)
+    }
+    this.cleanupTimers.clear()
   }
 }
 

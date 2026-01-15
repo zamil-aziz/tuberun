@@ -2,8 +2,12 @@ import { app, BrowserWindow } from 'electron'
 import { join } from 'path'
 import { existsSync, mkdirSync, chmodSync, createWriteStream, readdirSync, copyFileSync, unlinkSync, rmSync } from 'fs'
 import { pipeline } from 'stream/promises'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import https from 'https'
 import extractZip from 'extract-zip'
+
+const execFileAsync = promisify(execFile)
 
 // Platform detection
 const isWindows = process.platform === 'win32'
@@ -18,18 +22,14 @@ export const TUBERUN_DIR = isWindows
 const EXE_EXT = isWindows ? '.exe' : ''
 export const YTDLP_PATH = join(TUBERUN_DIR, `yt-dlp${EXE_EXT}`)
 export const FFMPEG_PATH = join(TUBERUN_DIR, `ffmpeg${EXE_EXT}`)
-export const DENO_PATH = join(TUBERUN_DIR, `deno${EXE_EXT}`)
 
 // Download URLs - macOS
 const YTDLP_URL_MAC = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos'
 const FFMPEG_URL_MAC = 'https://evermeet.cx/ffmpeg/getrelease/zip'
-const DENO_URL_MAC_ARM64 = 'https://github.com/denoland/deno/releases/latest/download/deno-aarch64-apple-darwin.zip'
-const DENO_URL_MAC_X64 = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-apple-darwin.zip'
 
 // Download URLs - Windows
 const YTDLP_URL_WIN = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
 const FFMPEG_URL_WIN = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
-const DENO_URL_WIN_X64 = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip'
 
 // Connection pool for faster downloads
 const downloadAgent = new https.Agent({
@@ -47,6 +47,9 @@ const RETRY_CONFIG = {
   timeout: 120000, // 2 minutes per download
 }
 
+// Maximum redirect depth to prevent infinite loops
+const MAX_REDIRECTS = 10
+
 // Get platform-specific URLs
 function getYtdlpUrl(): string {
   return isWindows ? YTDLP_URL_WIN : YTDLP_URL_MAC
@@ -54,11 +57,6 @@ function getYtdlpUrl(): string {
 
 function getFfmpegUrl(): string {
   return isWindows ? FFMPEG_URL_WIN : FFMPEG_URL_MAC
-}
-
-function getDenoUrl(): string {
-  if (isWindows) return DENO_URL_WIN_X64
-  return isArm64 ? DENO_URL_MAC_ARM64 : DENO_URL_MAC_X64
 }
 
 interface ProgressCallback {
@@ -76,19 +74,26 @@ export async function checkDependencies(): Promise<{ ready: boolean; missing: st
     missing.push('ffmpeg')
   }
 
-  if (!existsSync(DENO_PATH)) {
-    missing.push('deno')
-  }
-
   return {
     ready: missing.length === 0,
     missing,
   }
 }
 
-// Sleep helper for retry delays
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+// Sleep helper for retry delays with jitter
+function sleepWithJitter(baseMs: number): Promise<void> {
+  const jitter = Math.random() * 0.5 * baseMs
+  return new Promise(resolve => setTimeout(resolve, baseMs + jitter))
+}
+
+// Validate that a binary can be executed
+async function validateBinary(path: string, args: string[] = ['--version']): Promise<boolean> {
+  try {
+    await execFileAsync(path, args, { timeout: 10000 })
+    return true
+  } catch {
+    return false
+  }
 }
 
 // Main download function - now downloads in parallel
@@ -101,56 +106,52 @@ export async function downloadDependencies(
     mkdirSync(TUBERUN_DIR, { recursive: true })
   }
 
-  // Track individual progress for combined display
-  const progressState = new Map<string, number>([
-    ['yt-dlp', 0],
-    ['ffmpeg', 0],
-    ['deno', 0],
-  ])
+  // Track errors for each dependency
+  const errors: { name: string; error: string }[] = []
 
   // Create individual progress handlers
   const createProgressHandler = (step: string) => (percent: number) => {
-    progressState.set(step, percent)
     onProgress(step, percent, 'downloading')
   }
 
   // Start all downloads in parallel
   const downloadPromises = [
     downloadYtDlpWithRetry(createProgressHandler('yt-dlp'))
-      .then(() => {
+      .then(async () => {
+        // Validate the binary works
+        const valid = await validateBinary(YTDLP_PATH, ['--version'])
+        if (!valid) {
+          throw new Error('yt-dlp binary validation failed - file may be corrupted')
+        }
         onProgress('yt-dlp', 100, 'complete')
       })
       .catch((error) => {
+        errors.push({ name: 'yt-dlp', error: error.message })
         onProgress('yt-dlp', 0, 'error', error.message)
-        throw error
       }),
 
     downloadFFmpegWithRetry(createProgressHandler('ffmpeg'))
-      .then(() => {
+      .then(async () => {
+        // Validate the binary works
+        const valid = await validateBinary(FFMPEG_PATH, ['-version'])
+        if (!valid) {
+          throw new Error('FFmpeg binary validation failed - file may be corrupted')
+        }
         onProgress('ffmpeg', 100, 'complete')
       })
       .catch((error) => {
+        errors.push({ name: 'ffmpeg', error: error.message })
         onProgress('ffmpeg', 0, 'error', error.message)
-        throw error
-      }),
-
-    downloadDenoWithRetry(createProgressHandler('deno'))
-      .then(() => {
-        onProgress('deno', 100, 'complete')
-      })
-      .catch((error) => {
-        onProgress('deno', 0, 'error', error.message)
-        throw error
       }),
   ]
 
   // Wait for all downloads to complete
-  const results = await Promise.allSettled(downloadPromises)
+  await Promise.allSettled(downloadPromises)
 
-  // Check for failures
-  const failures = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
-  if (failures.length > 0) {
-    throw failures[0].reason
+  // Check for failures and report all of them
+  if (errors.length > 0) {
+    const errorMessages = errors.map(e => `${e.name}: ${e.error}`).join('; ')
+    throw new Error(`Failed to setup dependencies: ${errorMessages}`)
   }
 }
 
@@ -184,21 +185,6 @@ async function downloadFFmpegWithRetry(onProgress: (percent: number) => void): P
   })
 }
 
-async function downloadDenoWithRetry(onProgress: (percent: number) => void): Promise<void> {
-  const archivePath = join(TUBERUN_DIR, 'deno.zip')
-
-  await downloadWithRetry({
-    url: getDenoUrl(),
-    destPath: archivePath,
-    name: 'deno',
-    onProgress: (p) => onProgress(p * 0.8),
-    postProcess: async () => {
-      onProgress(80)
-      await extractDeno(archivePath)
-    },
-  })
-}
-
 interface DownloadWithRetryOptions {
   url: string
   destPath: string
@@ -214,7 +200,7 @@ async function downloadWithRetry(options: DownloadWithRetryOptions): Promise<voi
     try {
       if (attempt > 0) {
         const delay = RETRY_CONFIG.retryDelayBase * Math.pow(2, attempt - 1)
-        await sleep(delay)
+        await sleepWithJitter(delay)
       }
 
       await downloadFileWithTimeout(options.url, options.destPath, options.onProgress)
@@ -289,11 +275,24 @@ async function downloadFile(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     let currentUrl = url
+    let redirectCount = 0
 
     const handleResponse = (response: any) => {
-      // Handle redirects (301, 302, 303, 307, 308)
+      // Handle redirects (301, 302, 303, 307, 308) with loop protection
       if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
+        redirectCount++
+
+        if (redirectCount > MAX_REDIRECTS) {
+          reject(new Error(`Too many redirects (${MAX_REDIRECTS}). Possible redirect loop.`))
+          return
+        }
+
         const redirectUrl = response.headers.location
+        if (!redirectUrl) {
+          reject(new Error('Redirect response missing location header'))
+          return
+        }
+
         // Resolve relative URLs against the current URL
         const resolvedUrl = new URL(redirectUrl, currentUrl).href
         currentUrl = resolvedUrl
@@ -336,50 +335,53 @@ async function extractFFmpeg(archivePath: string): Promise<void> {
     mkdirSync(extractDir, { recursive: true })
   }
 
-  // Extract using extract-zip (cross-platform)
-  await extractZip(archivePath, { dir: extractDir })
+  try {
+    // Extract using extract-zip (cross-platform)
+    await extractZip(archivePath, { dir: extractDir })
 
-  // Find ffmpeg binary (cross-platform)
-  const ffmpegBinary = findFileRecursive(extractDir, isWindows ? 'ffmpeg.exe' : 'ffmpeg')
+    // Find ffmpeg binary (cross-platform)
+    const ffmpegBinary = findFileRecursive(extractDir, isWindows ? 'ffmpeg.exe' : 'ffmpeg')
 
-  if (ffmpegBinary) {
-    copyFileSync(ffmpegBinary, FFMPEG_PATH)
-    // Make executable on Unix systems
-    if (!isWindows) {
-      chmodSync(FFMPEG_PATH, 0o755)
+    if (ffmpegBinary) {
+      copyFileSync(ffmpegBinary, FFMPEG_PATH)
+      // Make executable on Unix systems
+      if (!isWindows) {
+        chmodSync(FFMPEG_PATH, 0o755)
+      }
+    } else {
+      throw new Error('FFmpeg binary not found in archive')
+    }
+  } finally {
+    // Cleanup - always try to clean up even if extraction fails
+    try {
+      rmSync(extractDir, { recursive: true, force: true })
+    } catch {
+      // Ignore cleanup errors
+    }
+    try {
+      unlinkSync(archivePath)
+    } catch {
+      // Ignore cleanup errors
     }
   }
-
-  // Cleanup
-  rmSync(extractDir, { recursive: true, force: true })
-  unlinkSync(archivePath)
-}
-
-async function extractDeno(archivePath: string): Promise<void> {
-  // Extract using extract-zip (cross-platform)
-  await extractZip(archivePath, { dir: TUBERUN_DIR })
-
-  // Make executable on Unix systems
-  if (!isWindows) {
-    chmodSync(DENO_PATH, 0o755)
-  }
-
-  // Cleanup
-  unlinkSync(archivePath)
 }
 
 // Helper function to recursively find a file by name
 function findFileRecursive(dir: string, filename: string): string | null {
-  const entries = readdirSync(dir, { withFileTypes: true })
+  try {
+    const entries = readdirSync(dir, { withFileTypes: true })
 
-  for (const entry of entries) {
-    const fullPath = join(dir, entry.name)
-    if (entry.isDirectory()) {
-      const found = findFileRecursive(fullPath, filename)
-      if (found) return found
-    } else if (entry.name === filename) {
-      return fullPath
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        const found = findFileRecursive(fullPath, filename)
+        if (found) return found
+      } else if (entry.name === filename) {
+        return fullPath
+      }
     }
+  } catch {
+    // Ignore directory read errors
   }
 
   return null
